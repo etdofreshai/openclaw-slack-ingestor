@@ -1,7 +1,16 @@
+/**
+ * OpenClaw Slack Ingestor
+ * 
+ * Two modes:
+ * 1. Archive import: npm run import -- --input /path/to/slack-export
+ * 2. Live sync: npm run sync -- <channel-id>
+ */
 import 'dotenv/config';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import pg from 'pg';
+
+// ── Types ────────────────────────────────────────────────────────────────────
 
 type Cli = { input: string; dryRun: boolean; verbose: boolean };
 
@@ -29,6 +38,8 @@ type Normalized = {
   metadata: Record<string, unknown>;
 };
 
+// ── CLI Parsing ──────────────────────────────────────────────────────────────
+
 function parseArgs(argv: string[]): Cli {
   const out: Cli = { input: '', dryRun: false, verbose: false };
   for (let i = 2; i < argv.length; i++) {
@@ -44,6 +55,8 @@ function parseArgs(argv: string[]): Cli {
   return out;
 }
 
+// ── File Walking ─────────────────────────────────────────────────────────────
+
 async function walkJson(root: string): Promise<string[]> {
   const out: string[] = [];
   async function walk(dir: string): Promise<void> {
@@ -57,6 +70,8 @@ async function walkJson(root: string): Promise<string[]> {
   await walk(root);
   return out;
 }
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 function tsToDate(ts: string): Date | null {
   const n = Number(ts);
@@ -124,6 +139,8 @@ async function ensureSourceId(pool: pg.Pool): Promise<number> {
   const inserted = await pool.query<{ id: number }>('INSERT INTO sources (name) VALUES ($1) RETURNING id', ['slack']);
   return inserted.rows[0].id;
 }
+
+// ── Main Import ──────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
   const cli = parseArgs(process.argv);
@@ -203,7 +220,19 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  console.error(err);
+// ── Entry Point ──────────────────────────────────────────────────────────────
+
+// Check if this is an import command (has --input flag)
+if (process.argv.includes('--input')) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+} else if (process.argv[1]?.includes('index.ts') || process.argv[1]?.includes('index.js')) {
+  // If run directly without --input, show usage
+  console.error('Usage:');
+  console.error('  Import archive: npm run import -- --input /path/to/slack-export');
+  console.error('  Live sync:      npm run sync -- <channel-id>');
+  console.error('  Server:         npm run server');
   process.exit(1);
-});
+}
