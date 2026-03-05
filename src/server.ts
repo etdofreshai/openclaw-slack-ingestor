@@ -293,9 +293,16 @@ export function handleLoginWs(req: IncomingMessage, socket: Socket, head: Buffer
     cdpWs.on("open", () => {
       cdpCommand("Page.enable");
       cdpCommand("Network.enable");
-      // Intercept popups (e.g. Google OAuth) — redirect main page instead of opening new window
+      // Intercept popups (e.g. Google OAuth, 2FA) — close popup and redirect main page
       cdpCommand("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true });
-      cdpCommand("Page.setInterceptFileChooserDialog", { enabled: false }).toString; // ignore errors
+      cdpCommand("Target.setDiscoverTargets", { discover: true });
+      // Override window.open to capture URLs before popups even spawn
+      cdpCommand("Page.addScriptToEvaluateOnNewDocument", {
+        source: `window.__origOpen = window.open; window.open = function(url) {
+          if (url && url !== 'about:blank') { window.location.href = url; return window; }
+          return window.__origOpen.apply(this, arguments);
+        };`
+      });
       cdpCommand("Page.startScreencast", {
         format: "jpeg",
         quality: 85,
@@ -333,15 +340,31 @@ export function handleLoginWs(req: IncomingMessage, socket: Socket, head: Buffer
 
         // ── Handle CDP events (method-based) ─────────────────────────────────
 
-        // Intercept popups (Google OAuth, etc.) — navigate main page to popup URL
+        // Intercept popups (Google OAuth, 2FA, etc.)
+        // Strategy: when a popup opens, attach to its target and switch screencast + input to it.
+        // When the popup closes (targetDestroyed), switch back to the original page.
         if (msg.method === "Target.targetCreated") {
-          const targetInfo = (msg.params as { targetInfo?: { type?: string; url?: string; openerId?: string } }).targetInfo;
-          if (targetInfo?.type === "page" && targetInfo.url && targetInfo.openerId) {
+          const targetInfo = (msg.params as { targetInfo?: { type?: string; url?: string; targetId?: string; openerId?: string } }).targetInfo;
+          if (targetInfo?.type === "page" && targetInfo.url && targetInfo.openerId && targetInfo.targetId) {
             const popupUrl = targetInfo.url;
+            console.log(`[login] Popup detected (${targetInfo.targetId}): ${popupUrl}`);
+            // Navigate the original page to the popup URL so everything stays in one target
+            // This is the most reliable approach for headless screencast
             if (popupUrl !== "about:blank") {
-              console.log(`[login] Popup detected → redirecting main page to: ${popupUrl}`);
+              // Close the popup target and navigate the main page instead
+              cdpCommand("Target.closeTarget", { targetId: targetInfo.targetId });
               cdpCommand("Page.navigate", { url: popupUrl });
+              console.log(`[login] Closed popup, navigating main page to: ${popupUrl}`);
             }
+          }
+        }
+
+        // Handle window.open interception via Page.windowOpen (fires before target is created)
+        if (msg.method === "Page.windowOpen") {
+          const params = msg.params as { url?: string };
+          if (params.url && params.url !== "about:blank") {
+            console.log(`[login] window.open intercepted → navigating to: ${params.url}`);
+            cdpCommand("Page.navigate", { url: params.url });
           }
         }
 
