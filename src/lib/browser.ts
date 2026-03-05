@@ -95,6 +95,7 @@ export async function ensureChromium(): Promise<void> {
         "--disable-default-apps",
         "--disable-notifications",
         "--disable-sync",
+        "--disable-popup-blocking",
         "--no-first-run",
         "--metrics-recording-only",
         "about:blank",
