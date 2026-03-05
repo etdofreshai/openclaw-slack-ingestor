@@ -179,6 +179,109 @@ async function fetchAllMessages(
   return allMessages;
 }
 
+/**
+ * Fetch thread replies for a single parent message via conversations.replies.
+ * Returns all reply messages (excluding the parent itself).
+ */
+async function fetchThreadReplies(
+  channelId: string,
+  threadTs: string,
+): Promise<RawSlackMessage[]> {
+  const apiToken = getApiToken() || '';
+  const allReplies: RawSlackMessage[] = [];
+  let cursor: string | undefined;
+
+  do {
+    const params: Record<string, string> = { token: apiToken, channel: channelId, ts: threadTs, limit: '200' };
+    if (cursor) params.cursor = cursor;
+
+    const body = new URLSearchParams(params);
+
+    let res: Response | undefined;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        res = await fetch(`${SLACK_API_BASE}/conversations.replies`, {
+          method: 'POST',
+          headers: {
+            Cookie: getCookieString(),
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Accept: 'application/json',
+          },
+          body: body.toString(),
+        });
+      } catch (err) {
+        if (attempt >= MAX_RETRIES) throw err;
+        await sleep(INITIAL_BACKOFF_MS * Math.pow(2, attempt));
+        continue;
+      }
+
+      if (res.status === 429) {
+        if (attempt >= MAX_RETRIES) throw new Error(`429 rate-limited fetching thread ${threadTs}`);
+        const retryAfter = res.headers.get('retry-after') ?? '5';
+        await sleep(Math.ceil((parseFloat(retryAfter) || 5) * 1000) + 500);
+        continue;
+      }
+      break;
+    }
+
+    if (!res || !res.ok) throw new Error(`Slack API HTTP ${res?.status} fetching thread ${threadTs}`);
+
+    const data = await res.json() as {
+      ok: boolean;
+      error?: string;
+      messages?: RawSlackMessage[];
+      has_more?: boolean;
+      response_metadata?: { next_cursor?: string };
+    };
+
+    if (!data.ok) throw new Error(`Slack API error fetching thread ${threadTs}: ${data.error}`);
+
+    // Skip the first message (parent) — only collect replies
+    for (const msg of data.messages ?? []) {
+      if (msg.ts !== threadTs) {
+        allReplies.push(msg);
+      }
+    }
+
+    cursor = data.has_more ? data.response_metadata?.next_cursor : undefined;
+  } while (cursor);
+
+  return allReplies;
+}
+
+/**
+ * For messages that are thread parents (have reply_count > 0),
+ * fetch all thread replies and return them as additional messages.
+ */
+async function fetchAllThreadReplies(
+  channelId: string,
+  messages: RawSlackMessage[],
+): Promise<RawSlackMessage[]> {
+  const threadParents = messages.filter(
+    m => m.thread_ts === m.ts && typeof m.reply_count === 'number' && (m.reply_count as number) > 0
+  );
+
+  if (threadParents.length === 0) return [];
+
+  console.log(`[live-sync] Fetching replies for ${threadParents.length} threads in channel ${channelId}`);
+
+  const allReplies: RawSlackMessage[] = [];
+  for (const parent of threadParents) {
+    try {
+      const replies = await fetchThreadReplies(channelId, parent.ts as string);
+      allReplies.push(...replies);
+      if (replies.length > 0) {
+        console.log(`[live-sync] Thread ${parent.ts}: ${replies.length} replies`);
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[live-sync] Failed to fetch replies for thread ${parent.ts}: ${msg}`);
+    }
+  }
+
+  return allReplies;
+}
+
 // ── Normalization ─────────────────────────────────────────────────────────────
 
 /** Get channel display name. Returns channelId if lookup fails. */
@@ -350,9 +453,13 @@ export async function syncSlackChannel(
     limit: options?.limit,
   });
 
+  // Fetch thread replies for any parent messages
+  const threadReplies = await fetchAllThreadReplies(channelId, rawMessages);
+  const allMessages = [...rawMessages, ...threadReplies];
+
   // Normalize messages (resolves sender names via API)
   const normalized: Normalized[] = [];
-  for (const msg of rawMessages) {
+  for (const msg of allMessages) {
     const n = await normalizeMessage(msg, channelId, channelName);
     if (n) normalized.push(n);
   }
@@ -375,7 +482,7 @@ export async function syncSlackChannel(
     }));
 
     const writeResult = await writeMessagesViaApi(inputs);
-    result = { fetched: rawMessages.length, ...writeResult };
+    result = { fetched: allMessages.length, ...writeResult };
   } else {
     // ── PostgreSQL write mode ───────────────────────────────────────────────
     const databaseUrl = process.env.DATABASE_URL;
@@ -389,7 +496,7 @@ export async function syncSlackChannel(
     const pool = new pg.Pool({ connectionString: databaseUrl });
     try {
       const writeResult = await writeToPostgres(pool, normalized);
-      result = { fetched: rawMessages.length, ...writeResult };
+      result = { fetched: allMessages.length, ...writeResult };
     } finally {
       await pool.end();
     }
