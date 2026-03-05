@@ -8,7 +8,7 @@
  *   PG mode   (fallback) : DATABASE_URL
  */
 import pg from 'pg';
-import { hasSession, getCookieString } from './session.js';
+import { hasSession, getCookieString, getApiToken } from './session.js';
 import { getUsername, getChannelInfo } from './slack-api.js';
 import { isApiMode, writeMessagesViaApi, type ApiMessagePayload } from './api-writer.js';
 
@@ -65,18 +65,22 @@ async function fetchPage(
   channelId: string,
   params: Record<string, string>
 ): Promise<{ messages: RawSlackMessage[]; hasMore: boolean; nextCursor?: string }> {
-  const url = new URL(`${SLACK_API_BASE}/conversations.history`);
-  url.search = new URLSearchParams({ channel: channelId, ...params }).toString();
+  const url = `${SLACK_API_BASE}/conversations.history`;
+  const apiToken = getApiToken() || '';
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     let res: Response;
 
     try {
-      res = await fetch(url.toString(), {
+      const body = new URLSearchParams({ token: apiToken, channel: channelId, ...params });
+      res = await fetch(url, {
+        method: 'POST',
         headers: {
           Cookie: getCookieString(),
+          'Content-Type': 'application/x-www-form-urlencoded',
           Accept: 'application/json',
         },
+        body: body.toString(),
       });
     } catch (err: unknown) {
       if (attempt >= MAX_RETRIES) throw err;
