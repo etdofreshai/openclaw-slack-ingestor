@@ -168,7 +168,7 @@ export async function listChannels(): Promise<{ channels: Array<{ id: string; na
     }
 
     for (const ch of result.data?.channels || []) {
-      channels.push({ id: ch.id, name: ch.name });
+      channels.push({ id: ch.id, name: ch.name || ch.id });
     }
 
     cursor = result.data?.response_metadata?.next_cursor;
