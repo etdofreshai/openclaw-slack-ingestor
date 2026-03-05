@@ -997,11 +997,11 @@ function renderJobsTable(jobs) {
       '<td>' + lastRun + '</td>' +
       '<td>' + statusPill + '</td>' +
       '<td><div class="actions">' +
-        '<button class="btn btn-sm btn-run" onclick="triggerJobRun(\'' + esc(j.id) + '\', this)">▶ Run</button>' +
-        '<button class="btn btn-sm btn-primary" onclick="triggerJobRunAll(\'' + esc(j.id) + '\', this)">⟳ All</button>' +
-        '<button class="btn btn-sm btn-ghost" onclick="editJob(\'' + esc(j.id) + '\')">✏ Edit</button>' +
-        '<button class="btn btn-sm ' + toggleClass + '" onclick="toggleJob(\'' + esc(j.id) + '\', ' + !j.enabled + ', this)">' + toggleLabel + '</button>' +
-        '<button class="btn btn-sm btn-danger" onclick="removeJob(\'' + esc(j.id) + '\', this)">✕</button>' +
+        '<button class="btn btn-sm btn-run" onclick="triggerJobRun(&apos;' + esc(j.id) + '&apos;, this)">▶ Run</button>' +
+        '<button class="btn btn-sm btn-primary" onclick="triggerJobRunAll(&apos;' + esc(j.id) + '&apos;, this)">⟳ All</button>' +
+        '<button class="btn btn-sm btn-ghost" onclick="editJob(&apos;' + esc(j.id) + '&apos;)">✏ Edit</button>' +
+        '<button class="btn btn-sm ' + toggleClass + '" onclick="toggleJob(&apos;' + esc(j.id) + '&apos;, ' + !j.enabled + ', this)">' + toggleLabel + '</button>' +
+        '<button class="btn btn-sm btn-danger" onclick="removeJob(&apos;' + esc(j.id) + '&apos;, this)">✕</button>' +
       '</div></td>' +
     '</tr>';
   }).join('');
