@@ -1,6 +1,6 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { hasSession } from './session.js';
-import { validateSession } from './slack-api.js';
+import { validateSession, listChannels } from './slack-api.js';
 import { syncSlackChannel, fetchChannelName } from './live-sync.js';
 import { isApiMode } from './api-writer.js';
 import {
@@ -71,6 +71,21 @@ router.get('/api/session/status', async (_req: Request, res: Response) => {
     user: validation.user,
     error: validation.error,
   });
+});
+
+// ── API: channels list (cached 15min) ───────────────────────────────────────────
+
+router.get('/api/channels', requireAuth, async (_req: Request, res: Response) => {
+  if (!hasSession()) {
+    res.status(401).json({ error: 'Not authenticated' });
+    return;
+  }
+  const result = await listChannels();
+  if (result.error) {
+    res.status(500).json({ error: result.error });
+    return;
+  }
+  res.json(result.channels);
 });
 
 // ── API: manual sync ────────────────────────────────────────────────────────────
@@ -644,11 +659,14 @@ tbody tr:hover td{background:rgba(255,255,255,.03)}
     <div class="auto-name-preview" id="auto-name-preview"></div>
   </div>
 
-  <!-- Channel ID (both modes) -->
+  <!-- Channel (both modes) -->
   <div class="field">
-    <label>Channel ID <span class="badge badge-req">required</span></label>
-    <p class="field-hint">The Slack channel or conversation ID (e.g. <code>C0123456789</code> for public channels, <code>D0123456789</code> for DMs). Find it in Slack: right-click channel → View channel details → scroll to bottom.</p>
-    <input type="text" id="channel" placeholder="e.g. C0123456789" autocomplete="off" oninput="updateAutoNamePreview()"/>
+    <label>Channel <span class="badge badge-req">required</span></label>
+    <p class="field-hint">Select a channel from your Slack account, or paste a channel ID manually.</p>
+    <select id="channel-select" onchange="onChannelSelect()">
+      <option value="">— Loading channels… —</option>
+    </select>
+    <input type="text" id="channel" placeholder="or paste channel ID (e.g. C0123456789)" autocomplete="off" oninput="updateAutoNamePreview()" style="margin-top:6px"/>
   </div>
 
   <!-- Cadence (scheduled only) -->
@@ -1236,8 +1254,36 @@ function reltime(iso) {
   return Math.round(diff/86400000) + 'd ago';
 }
 
+// ── Channel picker ──────────────────────────────────────────────────────────
+let _channelsLoaded = false;
+async function loadChannels() {
+  if (_channelsLoaded) return;
+  const sel = document.getElementById('channel-select');
+  if (!sel) return;
+  try {
+    const res = await fetch('/api/channels', { headers: getHeaders() });
+    if (!res.ok) { sel.innerHTML = '<option value="">— Failed to load channels —</option>'; return; }
+    const channels = await res.json();
+    let html = '<option value="">— Select a channel —</option>';
+    for (const ch of channels) {
+      html += '<option value="' + esc(ch.id) + '">#' + esc(ch.name) + '</option>';
+    }
+    sel.innerHTML = html;
+    _channelsLoaded = true;
+  } catch (e) {
+    sel.innerHTML = '<option value="">— Error loading channels —</option>';
+  }
+}
+function onChannelSelect() {
+  const sel = document.getElementById('channel-select');
+  const input = document.getElementById('channel');
+  if (sel.value) { input.value = sel.value; }
+  updateAutoNamePreview();
+}
+
 function loadAll() {
   loadLoginStatus();
+  loadChannels();
   loadJobsTable();
   loadRunsTable();
   loadQueueStatus();

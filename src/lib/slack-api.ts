@@ -142,9 +142,15 @@ export async function validateSession(): Promise<{ valid: boolean; team?: string
 }
 
 /**
- * List available conversations/channels.
+ * List available conversations/channels (cached for 15 minutes).
  */
+let _channelCache: { channels: Array<{ id: string; name: string }>; cachedAt: number } | null = null;
+const CHANNEL_CACHE_TTL_MS = 15 * 60 * 1000;
+
 export async function listChannels(): Promise<{ channels: Array<{ id: string; name: string }>; error?: string }> {
+  if (_channelCache && Date.now() - _channelCache.cachedAt < CHANNEL_CACHE_TTL_MS) {
+    return { channels: _channelCache.channels };
+  }
   const channels: Array<{ id: string; name: string }> = [];
   let cursor: string | undefined;
 
@@ -168,6 +174,9 @@ export async function listChannels(): Promise<{ channels: Array<{ id: string; na
     cursor = result.data?.response_metadata?.next_cursor;
   } while (cursor);
 
+  // Sort alphabetically by name
+  channels.sort((a, b) => a.name.localeCompare(b.name));
+  _channelCache = { channels, cachedAt: Date.now() };
   return { channels };
 }
 
