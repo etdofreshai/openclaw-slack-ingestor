@@ -293,6 +293,9 @@ export function handleLoginWs(req: IncomingMessage, socket: Socket, head: Buffer
     cdpWs.on("open", () => {
       cdpCommand("Page.enable");
       cdpCommand("Network.enable");
+      // Intercept popups (e.g. Google OAuth) — redirect main page instead of opening new window
+      cdpCommand("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true });
+      cdpCommand("Page.setInterceptFileChooserDialog", { enabled: false }).toString; // ignore errors
       cdpCommand("Page.startScreencast", {
         format: "jpeg",
         quality: 85,
@@ -329,6 +332,19 @@ export function handleLoginWs(req: IncomingMessage, socket: Socket, head: Buffer
         }
 
         // ── Handle CDP events (method-based) ─────────────────────────────────
+
+        // Intercept popups (Google OAuth, etc.) — navigate main page to popup URL
+        if (msg.method === "Target.targetCreated") {
+          const targetInfo = (msg.params as { targetInfo?: { type?: string; url?: string; openerId?: string } }).targetInfo;
+          if (targetInfo?.type === "page" && targetInfo.url && targetInfo.openerId) {
+            const popupUrl = targetInfo.url;
+            if (popupUrl !== "about:blank") {
+              console.log(`[login] Popup detected → redirecting main page to: ${popupUrl}`);
+              cdpCommand("Page.navigate", { url: popupUrl });
+            }
+          }
+        }
+
         if (msg.method === "Page.screencastFrame") {
           const params = msg.params as { sessionId: number; data: string; metadata: unknown };
           if (clientWs.readyState === NodeWebSocket.OPEN) {
