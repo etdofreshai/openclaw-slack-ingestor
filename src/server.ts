@@ -15,7 +15,7 @@ import {
   cdpListTabs,
   cdpCloseTab,
 } from "./lib/browser.js";
-import { setCookies, saveSessionToFile, loadSessionFromFile, hasSession, isAuthCookie } from "./lib/session.js";
+import { setCookies, saveSessionToFile, loadSessionFromFile, hasSession, isAuthCookie, setApiToken } from "./lib/session.js";
 import { validateSession, listChannels } from "./lib/slack-api.js";
 import syncRouter from "./lib/sync-router.js";
 import { startScheduler } from "./lib/scheduler.js";
@@ -209,7 +209,11 @@ export function handleLoginWs(req: IncomingMessage, socket: Socket, head: Buffer
     const cdpWs = new NodeWebSocket(cdpWsUrl);
     let cmdId = 1;
     const capturedCookies: Record<string, string> = {};
+    let capturedApiToken = "";    // xoxc-* token
     let loginDetected = false;
+    let tokenExtractionPending = false;
+    // Map from CDP command id → purpose string for handling responses
+    const pendingCommands = new Map<number, string>();
 
     function cdpCommand(method: string, params: Record<string, unknown> = {}) {
       const id = cmdId++;
@@ -219,26 +223,70 @@ export function handleLoginWs(req: IncomingMessage, socket: Socket, head: Buffer
       return id;
     }
 
+    /**
+     * Try to extract the xoxc-* token from the page via CDP Runtime.evaluate.
+     * Searches localStorage and page HTML. Non-blocking; result handled in message handler.
+     */
+    function tryExtractApiToken() {
+      if (tokenExtractionPending) return;
+      tokenExtractionPending = true;
+      const id = cdpCommand("Runtime.evaluate", {
+        expression: `(function() {
+          try {
+            // 1. Check localStorage for boot data containing xoxc token
+            for (let i = 0; i < localStorage.length; i++) {
+              const key = localStorage.key(i);
+              const val = localStorage.getItem(key);
+              if (val && val.includes('xoxc-')) {
+                const m = val.match(/xoxc-[a-zA-Z0-9-]+/);
+                if (m) return m[0];
+              }
+            }
+          } catch(e) {}
+          // 2. Search page HTML (boot data is embedded in script tags)
+          try {
+            const m = document.documentElement.innerHTML.match(/xoxc-[a-zA-Z0-9-]+/);
+            if (m) return m[0];
+          } catch(e) {}
+          return null;
+        })()`,
+        returnByValue: true,
+      });
+      pendingCommands.set(id, "extractToken");
+    }
+
     async function checkAndCapture() {
-      if (capturedCookies["d"] && session && !loginDetected) {
-        loginDetected = true;
-        console.log("[login] Auth cookies captured!");
-        setCookies(capturedCookies);
+      if (!session || loginDetected) return;
 
-        const validation = await validateSession();
+      const hasDCookie = Boolean(capturedCookies["d"]);
+      if (!hasDCookie) return;
 
-        if (validation.valid) {
-          await saveSessionToFile();
-          session.status = "success";
-          session.message = `✅ Logged in as ${validation.user} (${validation.team})`;
-          if (clientWs.readyState === NodeWebSocket.OPEN) {
-            clientWs.send(JSON.stringify({ type: "success", user: validation.user, team: validation.team }));
-          }
-          setTimeout(() => closeSession(), 4000);
-        } else {
-          loginDetected = false;
-          console.log("[login] Session captured but validation failed:", validation.error);
+      if (!capturedApiToken) {
+        // d cookie found but no xoxc token yet — try to extract it from the page
+        console.log("[login] d cookie captured, extracting xoxc-* token from page...");
+        tryExtractApiToken();
+        return; // Will be re-invoked when token is captured
+      }
+
+      // Both d cookie and xoxc token are present — proceed with validation
+      loginDetected = true;
+      console.log("[login] Auth cookies + xoxc-* token captured — validating...");
+      setCookies(capturedCookies);
+      setApiToken(capturedApiToken);
+
+      const validation = await validateSession();
+
+      if (validation.valid) {
+        await saveSessionToFile();
+        session.status = "success";
+        session.message = `✅ Logged in as ${validation.user} (${validation.team})`;
+        if (clientWs.readyState === NodeWebSocket.OPEN) {
+          clientWs.send(JSON.stringify({ type: "success", user: validation.user, team: validation.team }));
         }
+        setTimeout(() => closeSession(), 4000);
+      } else {
+        loginDetected = false;
+        console.log("[login] Session captured but validation failed:", validation.error);
       }
     }
 
@@ -256,16 +304,38 @@ export function handleLoginWs(req: IncomingMessage, socket: Socket, head: Buffer
     cdpWs.on("message", (data) => {
       try {
         const msg = JSON.parse(data.toString()) as {
+          id?: number;
+          result?: Record<string, unknown>;
           method?: string;
           params?: Record<string, unknown>;
         };
 
+        // ── Handle CDP command responses (id-based) ──────────────────────────
+        if (msg.id !== undefined && msg.result !== undefined) {
+          const purpose = pendingCommands.get(msg.id);
+          if (purpose === "extractToken") {
+            pendingCommands.delete(msg.id);
+            tokenExtractionPending = false;
+            const value = (msg.result as { result?: { value?: string } }).result?.value;
+            if (typeof value === "string" && value.startsWith("xoxc-")) {
+              capturedApiToken = value;
+              console.log("[login] xoxc-* token extracted via Runtime.evaluate");
+              checkAndCapture();
+            } else {
+              console.log("[login] Runtime.evaluate: xoxc token not found in page yet, waiting for network...");
+            }
+          }
+          return;
+        }
+
+        // ── Handle CDP events (method-based) ─────────────────────────────────
         if (msg.method === "Page.screencastFrame") {
           const params = msg.params as { sessionId: number; data: string; metadata: unknown };
           if (clientWs.readyState === NodeWebSocket.OPEN) {
             clientWs.send(JSON.stringify({ type: "frame", data: params.data, metadata: params.metadata }));
           }
           cdpCommand("Page.screencastFrameAck", { sessionId: params.sessionId });
+
         } else if (msg.method === "Network.responseReceivedExtraInfo") {
           const headers = (msg.params as { headers?: Record<string, string> }).headers || {};
           for (const [name, value] of Object.entries(headers)) {
@@ -280,6 +350,7 @@ export function handleLoginWs(req: IncomingMessage, socket: Socket, head: Buffer
             }
           }
           checkAndCapture();
+
         } else if (msg.method === "Network.requestWillBeSentExtraInfo") {
           const params = msg.params as {
             associatedCookies?: Array<{ cookie: { name: string; value: string } }>;
@@ -305,9 +376,28 @@ export function handleLoginWs(req: IncomingMessage, socket: Socket, head: Buffer
             }
           }
           checkAndCapture();
+
+        } else if (msg.method === "Network.requestWillBeSent") {
+          // Intercept xoxc-* token from Slack API POST bodies (token=xoxc-...)
+          if (!capturedApiToken) {
+            const params = msg.params as {
+              request?: { url?: string; method?: string; postData?: string };
+            };
+            const postData = params.request?.postData;
+            if (postData && postData.includes("token=xoxc-")) {
+              const match = postData.match(/token=(xoxc-[a-zA-Z0-9-]+)/);
+              if (match) {
+                capturedApiToken = match[1];
+                console.log("[login] xoxc-* token captured from POST body (Network.requestWillBeSent)");
+                checkAndCapture();
+              }
+            }
+          }
+
         } else if (msg.method === "Page.frameNavigated") {
           const url = (msg.params as { frame?: { url?: string } })?.frame?.url || "";
           if (url.includes(".slack.com/archives") || url.includes("app.slack.com/client")) {
+            // Page has loaded Slack workspace — try token extraction after a short delay
             setTimeout(() => checkAndCapture(), 2000);
           }
         }

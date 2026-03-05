@@ -23,6 +23,8 @@ interface SlackSession {
   userId?: string;
   userName?: string;
   lastValidated?: string;
+  /** xoxc-* client token required for Slack Web API calls */
+  apiToken?: string;
 }
 
 const session: SlackSession = {
@@ -52,9 +54,35 @@ export function getCookieString(): string {
     .join("; ");
 }
 
+/**
+ * Full auth requires BOTH the `d` cookie AND an xoxc-* API token.
+ * Without both, Slack API calls will return not_authed.
+ */
 export function hasSession(): boolean {
-  // Check for 'd' cookie which is the main Slack auth cookie
+  return Boolean(session.cookies["d"] && session.apiToken);
+}
+
+/**
+ * True when only the `d` cookie is present (partial auth — token still needed).
+ */
+export function hasDCookie(): boolean {
   return Boolean(session.cookies["d"]);
+}
+
+/** Get the captured xoxc-* API token. */
+export function getApiToken(): string | undefined {
+  return session.apiToken;
+}
+
+/** Store the captured xoxc-* API token. */
+export function setApiToken(token: string): void {
+  session.apiToken = token;
+  console.log("[session] xoxc-* API token stored");
+}
+
+/** True when an xoxc-* token has been captured. */
+export function hasApiToken(): boolean {
+  return Boolean(session.apiToken);
 }
 
 export function setSessionInfo(info: Partial<SlackSession>) {
@@ -124,6 +152,10 @@ export async function loadSessionFromFile(): Promise<boolean> {
     if (parsed.userId) session.userId = parsed.userId;
     if (parsed.userName) session.userName = parsed.userName;
     if (parsed.lastValidated) session.lastValidated = parsed.lastValidated;
+    if (parsed.apiToken) {
+      session.apiToken = parsed.apiToken;
+      console.log("[session] xoxc-* API token loaded from file");
+    }
     
     const ok = hasSession();
     if (ok) {
@@ -132,6 +164,8 @@ export async function loadSessionFromFile(): Promise<boolean> {
       if (filePath === LEGACY_SESSION_FILE) {
         await saveSessionToFile().catch(() => {});
       }
+    } else if (session.cookies["d"] && !session.apiToken) {
+      console.warn("[session] Loaded d cookie but no xoxc-* token — re-login required to capture API token");
     }
     return ok;
   } catch (err: unknown) {
@@ -148,6 +182,7 @@ export async function loadSessionFromFile(): Promise<boolean> {
  */
 export function clearSession(): void {
   session.cookies = {};
+  session.apiToken = undefined;
   session.teamId = undefined;
   session.teamName = undefined;
   session.userId = undefined;

@@ -1,8 +1,14 @@
 /**
  * Slack Web API helpers for token validation and message sync.
- * Uses captured session cookies to make authenticated requests.
+ *
+ * Auth flow: Slack's API requires BOTH:
+ *   1. The `d` cookie (browser session auth)
+ *   2. An `xoxc-*` client token sent as a POST form parameter
+ *
+ * All requests use POST with application/x-www-form-urlencoded.
+ * The xoxc token is captured during login and persisted with the session.
  */
-import { getCookieString, hasSession, setSessionInfo } from "./session.js";
+import { getCookieString, hasSession, setSessionInfo, getApiToken } from "./session.js";
 
 const SLACK_API_BASE = "https://slack.com/api";
 
@@ -61,37 +67,52 @@ interface UserInfoResponse {
   };
 }
 
-// Simple fetch wrapper with session cookies
+/**
+ * POST-based Slack API wrapper.
+ *
+ * Slack's Web API requires:
+ *  - Cookie header with the `d` session cookie
+ *  - `token` POST field with the xoxc-* client token
+ *  - Content-Type: application/x-www-form-urlencoded
+ */
 async function slackFetch<T>(endpoint: string, params: Record<string, string> = {}): Promise<ApiResponse<T>> {
   if (!hasSession()) {
-    return { ok: false, error: "No active Slack session" };
+    const apiToken = getApiToken();
+    if (!apiToken) {
+      return { ok: false, error: "No xoxc-* API token — please re-login to capture token" };
+    }
+    return { ok: false, error: "No active Slack session (d cookie missing)" };
   }
 
-  const url = new URL(`${SLACK_API_BASE}/${endpoint}`);
-  const searchParams = new URLSearchParams(params);
-  url.search = searchParams.toString();
+  const apiToken = getApiToken()!;
+  const url = `${SLACK_API_BASE}/${endpoint}`;
+
+  // Build POST body: token first, then any additional params
+  const formParams = new URLSearchParams({ token: apiToken, ...params });
 
   try {
-    const res = await fetch(url.toString(), {
-      method: "GET",
+    const res = await fetch(url, {
+      method: "POST",
       headers: {
         "Cookie": getCookieString(),
+        "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
       },
+      body: formParams.toString(),
     });
 
     if (!res.ok) {
       return { ok: false, error: `HTTP ${res.status}` };
     }
 
-    const data = await res.json() as any;
+    const data = await res.json() as Record<string, unknown>;
     if (!data.ok) {
-      return { ok: false, error: data.error || "Unknown API error" };
+      return { ok: false, error: (data.error as string) || "Unknown API error" };
     }
 
-    return { ok: true, data };
-  } catch (err: any) {
-    return { ok: false, error: err.message };
+    return { ok: true, data: data as T };
+  } catch (err: unknown) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
