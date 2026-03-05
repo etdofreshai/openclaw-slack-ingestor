@@ -87,6 +87,9 @@ async function slackFetch<T>(endpoint: string, params: Record<string, string> = 
   const apiToken = getApiToken()!;
   const url = `${SLACK_API_BASE}/${endpoint}`;
 
+  // Debug: log token prefix for troubleshooting auth issues
+  console.log(`[slack-api] ${endpoint} — token: ${apiToken.slice(0, 10)}…, d cookie: ${getCookieString().includes('d=') ? 'present' : 'MISSING'}`);
+
   // Build POST body: token first, then any additional params
   const formParams = new URLSearchParams({ token: apiToken, ...params });
 
