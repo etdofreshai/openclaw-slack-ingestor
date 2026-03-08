@@ -18,6 +18,7 @@ import {
 import { setCookies, saveSessionToFile, loadSessionFromFile, hasSession, isAuthCookie, setApiToken } from "./lib/session.js";
 import { validateSession, listChannels } from "./lib/slack-api.js";
 import syncRouter from "./lib/sync-router.js";
+import backfillRouter from "./lib/backfill-router.js";
 import { startScheduler } from "./lib/scheduler.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -195,6 +196,10 @@ app.post("/api/logout", async (_req, res) => {
 // ── Mount sync router (UI + API) ──────────────────────────────────────────────
 
 app.use(syncRouter);
+
+// ── Mount backfill router (UI + API) ─────────────────────────────────────────
+
+app.use(backfillRouter);
 
 // ── WebSocket Handler ────────────────────────────────────────────────────────
 
