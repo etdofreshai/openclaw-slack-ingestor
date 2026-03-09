@@ -12,11 +12,13 @@
  * Metric caveats (API mode):
  *   - `inserted`  → HTTP 201 (Created) response from the API
  *   - `updated`   → HTTP 200 (OK) or 409 (Conflict) responses (existing record)
- *   - `skipped`   → unrecoverable errors (bad request, exhausted retries, etc.)
+ *   - `skipped`   → unrecoverable errors (bad request, auth failure, etc.)
  *   - If the API always returns 200 for upserts (never 201), all successful
  *     writes will appear as `updated` and `inserted` will be 0. The sum
  *     inserted + updated + skipped always equals `fetched`.
  */
+
+import { downloadSlackFile } from './attachment-downloader.js';
 
 /** Maximum number of retries on transient failures (429, 5xx, network errors). */
 const MAX_API_RETRIES = 3;
@@ -46,6 +48,17 @@ export type ApiMessagePayload = {
   metadata: Record<string, unknown>;
 };
 
+/** A Slack file object as stored in metadata.files. */
+export type SlackFileRef = {
+  id?: string;
+  name: string;
+  mimetype?: string;
+  size?: number;
+  url_private_download?: string;
+  url_private?: string;
+  [k: string]: unknown;
+};
+
 /** Write result for a single message — for internal use. */
 type SingleWriteOutcome = 'inserted' | 'updated' | 'skipped';
 
@@ -55,6 +68,8 @@ export type ApiWriteResult = {
   updated: number;
   skipped: number;
   attachmentsSeen: number;
+  attachmentsDownloaded: number;
+  attachmentsIngested: number;
 };
 
 /**
@@ -158,31 +173,187 @@ async function writeOneMessage(
 }
 
 /**
- * Write a batch of normalized Slack messages to the Memory Database API.
+ * Ingest a single file attachment via POST /api/messages/ingest (multipart).
+ * Returns true on success, false on failure.
+ */
+async function ingestOneFile(
+  baseUrl: string,
+  token: string,
+  payload: ApiMessagePayload,
+  fileBuffer: Buffer,
+  file: SlackFileRef
+): Promise<boolean> {
+  const filename = file.name || 'attachment';
+  const contentType = file.mimetype || 'application/octet-stream';
+  const attachmentsMeta = [
+    {
+      original_file_name: filename,
+      created_at_source: payload.timestamp,
+    },
+  ];
+
+  for (let attempt = 0; attempt <= MAX_API_RETRIES; attempt++) {
+    try {
+      const form = new FormData();
+      form.append('message', JSON.stringify(payload));
+      form.append(
+        'files',
+        new Blob([new Uint8Array(fileBuffer)], { type: contentType }),
+        filename
+      );
+      form.append('attachments_meta', JSON.stringify(attachmentsMeta));
+
+      const res = await fetch(`${baseUrl}/api/messages/ingest`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'User-Agent': 'openclaw-slack-ingestor/1.0',
+        },
+        body: form,
+      });
+
+      if (res.status === 429) {
+        const retryAfter = parseFloat(res.headers.get('retry-after') ?? '5');
+        const waitMs = Math.ceil(retryAfter * 1000) + 500;
+        console.warn(
+          `[api-writer] 429 rate limit on ingest for ${filename}, waiting ${waitMs}ms (attempt ${attempt + 1}/${MAX_API_RETRIES + 1})`
+        );
+        await sleep(waitMs);
+        continue;
+      }
+
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error(`API returned ${res.status}: ${body.slice(0, 500)}`);
+      }
+
+      console.log(`[api-writer] ✓ Ingested attachment ${filename} for ${payload.external_id}`);
+      return true;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (attempt >= MAX_API_RETRIES) {
+        console.error(`[api-writer] Failed to ingest ${filename} for ${payload.external_id}: ${msg}`);
+        return false;
+      }
+      const backoff = INITIAL_BACKOFF_MS * Math.pow(2, attempt);
+      console.warn(
+        `[api-writer] Error ingesting ${filename} (attempt ${attempt + 1}), retrying in ${backoff}ms: ${msg}`
+      );
+      await sleep(backoff);
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Write a message that has file attachments.
  *
- * @param payloads     - Array of `{ payload, attachmentCount }` pairs to write.
- * @returns            - Aggregate result: inserted, updated, skipped, attachmentsSeen.
+ * For each file:
+ *   1. Download from Slack (cookie + token auth)
+ *   2. POST to /api/messages/ingest (multipart)
+ *
+ * If ALL files fail, falls back to plain JSON write.
+ * Returns outcome plus download/ingest counts.
+ */
+async function writeMessageWithFiles(
+  baseUrl: string,
+  writeToken: string,
+  payload: ApiMessagePayload,
+  files: SlackFileRef[]
+): Promise<{
+  outcome: SingleWriteOutcome;
+  downloaded: number;
+  ingested: number;
+}> {
+  let downloaded = 0;
+  let ingested = 0;
+
+  for (const file of files) {
+    const downloadUrl = file.url_private_download || file.url_private;
+    if (!downloadUrl) {
+      console.warn(
+        `[api-writer] No download URL for file ${file.name} in message ${payload.external_id} — skipping`
+      );
+      continue;
+    }
+
+    let fileBuffer: Buffer;
+    try {
+      fileBuffer = await downloadSlackFile(downloadUrl, file.name);
+      downloaded++;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[api-writer] Failed to download ${file.name} for ${payload.external_id}: ${msg} — skipping file`
+      );
+      continue;
+    }
+
+    const ok = await ingestOneFile(baseUrl, writeToken, payload, fileBuffer, file);
+    if (ok) ingested++;
+  }
+
+  // If we successfully ingested at least one file, report updated (upsert occurred via ingest)
+  if (ingested > 0) {
+    return { outcome: 'updated', downloaded, ingested };
+  }
+
+  // All files failed — fall back to plain JSON write
+  console.warn(
+    `[api-writer] All file downloads/ingests failed for ${payload.external_id} — falling back to plain JSON write`
+  );
+  const outcome = await writeOneMessage(baseUrl, writeToken, payload);
+  return { outcome, downloaded, ingested };
+}
+
+/**
+ * Write a batch of normalized Slack messages to the Memory Database API.
+ * Messages with attachments are ingested via multipart /api/messages/ingest.
+ * Messages without attachments are written via plain JSON POST /api/messages.
+ *
+ * @param payloads - Array of `{ payload, attachmentCount, files? }` to write.
+ * @returns        - Aggregate result: inserted, updated, skipped, attachmentsSeen,
+ *                  attachmentsDownloaded, attachmentsIngested.
  */
 export async function writeMessagesViaApi(
-  payloads: Array<{ payload: ApiMessagePayload; attachmentCount: number }>
+  payloads: Array<{ payload: ApiMessagePayload; attachmentCount: number; files?: SlackFileRef[] }>
 ): Promise<ApiWriteResult> {
   const baseUrl = (process.env.MEMORY_DATABASE_API_URL ?? '').replace(/\/+$/, '');
-  const token = process.env.MEMORY_DATABASE_API_TOKEN ?? '';
+  const readToken = process.env.MEMORY_DATABASE_API_TOKEN ?? '';
+  const writeToken = process.env.MEMORY_DATABASE_API_WRITE_TOKEN ?? readToken;
 
   let inserted = 0;
   let updated = 0;
   let skipped = 0;
   let attachmentsSeen = 0;
+  let attachmentsDownloaded = 0;
+  let attachmentsIngested = 0;
 
-  for (const { payload, attachmentCount } of payloads) {
+  for (const { payload, attachmentCount, files } of payloads) {
     attachmentsSeen += attachmentCount;
-    const outcome = await writeOneMessage(baseUrl, token, payload);
-    if (outcome === 'inserted') inserted++;
-    else if (outcome === 'updated') updated++;
-    else skipped++;
+
+    if (attachmentCount > 0 && files && files.length > 0) {
+      const { outcome, downloaded, ingested } = await writeMessageWithFiles(
+        baseUrl,
+        writeToken,
+        payload,
+        files
+      );
+      attachmentsDownloaded += downloaded;
+      attachmentsIngested += ingested;
+      if (outcome === 'inserted') inserted++;
+      else if (outcome === 'updated') updated++;
+      else skipped++;
+    } else {
+      const outcome = await writeOneMessage(baseUrl, writeToken, payload);
+      if (outcome === 'inserted') inserted++;
+      else if (outcome === 'updated') updated++;
+      else skipped++;
+    }
   }
 
-  return { inserted, updated, skipped, attachmentsSeen };
+  return { inserted, updated, skipped, attachmentsSeen, attachmentsDownloaded, attachmentsIngested };
 }
 
 function sleep(ms: number): Promise<void> {

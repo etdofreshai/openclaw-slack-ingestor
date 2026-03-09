@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { randomUUID } from 'crypto';
-import { getCookieString, getApiToken, hasSession } from '../lib/session.js';
+import { getApiToken, hasSession, getCookieString } from '../lib/session.js';
+import { downloadSlackFile } from '../lib/attachment-downloader.js';
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -51,49 +52,6 @@ export type ProgressCallback = (progress: BackfillProgress) => void;
 
 async function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-/**
- * Download a Slack file using cookie + token auth.
- */
-async function downloadSlackFile(url: string, filename: string, maxRetries = 3): Promise<Buffer> {
-  const cookieString = getCookieString();
-  const apiToken = getApiToken();
-
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      const headers: Record<string, string> = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cache-Control': 'no-cache',
-      };
-      if (cookieString) headers['Cookie'] = cookieString;
-      if (apiToken) headers['Authorization'] = `Bearer ${apiToken}`;
-
-      const res = await fetch(url, { headers });
-
-      if (res.status === 429) {
-        const retryAfter = parseFloat(res.headers.get('retry-after') ?? '5');
-        const waitMs = Math.ceil(retryAfter * 1000) + 500;
-        console.log(`[backfill-download] Rate limited on ${filename}, waiting ${waitMs}ms`);
-        await sleep(waitMs);
-        continue;
-      }
-
-      if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-
-      const buf = Buffer.from(await res.arrayBuffer());
-      console.log(`[backfill-download] ✓ Downloaded ${filename} (${buf.length} bytes)`);
-      return buf;
-    } catch (err: any) {
-      console.log(`[backfill-download] Attempt ${attempt + 1}/${maxRetries + 1} failed for ${filename}: ${err.message}`);
-      if (attempt >= maxRetries) throw err;
-      await sleep(1000 * Math.pow(2, attempt));
-    }
-  }
-
-  throw new Error(`Failed to download ${filename} after retries`);
 }
 
 /**

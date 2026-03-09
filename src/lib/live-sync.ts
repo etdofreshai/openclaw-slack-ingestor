@@ -10,7 +10,7 @@
 import pg from 'pg';
 import { hasSession, getCookieString, getApiToken } from './session.js';
 import { getUsername, getChannelInfo } from './slack-api.js';
-import { isApiMode, writeMessagesViaApi, type ApiMessagePayload } from './api-writer.js';
+import { isApiMode, writeMessagesViaApi, type ApiMessagePayload, type SlackFileRef } from './api-writer.js';
 
 const SLACK_API_BASE = 'https://slack.com/api';
 
@@ -50,6 +50,8 @@ export interface SyncResult {
   updated: number;
   skipped: number;
   attachmentsSeen: number;
+  attachmentsDownloaded: number;
+  attachmentsIngested: number;
 }
 
 // ── Slack API fetch helpers ────────────────────────────────────────────────────
@@ -479,6 +481,7 @@ export async function syncSlackChannel(
         metadata: msg.metadata,
       } satisfies ApiMessagePayload,
       attachmentCount: msg.attachmentCount,
+      files: (msg.metadata.files ?? []) as SlackFileRef[],
     }));
 
     const writeResult = await writeMessagesViaApi(inputs);
@@ -496,7 +499,7 @@ export async function syncSlackChannel(
     const pool = new pg.Pool({ connectionString: databaseUrl });
     try {
       const writeResult = await writeToPostgres(pool, normalized);
-      result = { fetched: allMessages.length, ...writeResult };
+      result = { fetched: allMessages.length, ...writeResult, attachmentsDownloaded: 0, attachmentsIngested: 0 };
     } finally {
       await pool.end();
     }
@@ -507,7 +510,8 @@ export async function syncSlackChannel(
     console.log(
       `[live-sync] Slack ${channelId} [${mode}]: fetched=${result.fetched}, ` +
       `inserted=${result.inserted}, updated=${result.updated}, ` +
-      `skipped=${result.skipped}, attachmentsSeen=${result.attachmentsSeen}`
+      `skipped=${result.skipped}, attachmentsSeen=${result.attachmentsSeen}, ` +
+      `attachmentsDownloaded=${result.attachmentsDownloaded}, attachmentsIngested=${result.attachmentsIngested}`
     );
   }
 
