@@ -56,12 +56,14 @@ router.post('/api/backfill/start', requireAuth, async (req: Request, res: Respon
     dryRun = false,
     resumeFrom = 1,
     mode = 'slack-api',
+    attachmentMode = 'missing',
   } = req.body as {
     batchSize?: number;
     limit?: number;
     dryRun?: boolean;
     resumeFrom?: number;
     mode?: BackfillMode;
+    attachmentMode?: 'missing' | 'force';
   };
 
   const existingActive = await getActiveBackfillRun();
@@ -76,6 +78,7 @@ router.post('/api/backfill/start', requireAuth, async (req: Request, res: Respon
     dryRun,
     resumeFrom: Math.max(1, resumeFrom),
     mode: mode === 'memory-db' ? 'memory-db' : 'slack-api',
+    attachmentMode: attachmentMode === 'force' ? 'force' : 'missing',
   };
 
   try {
@@ -249,7 +252,7 @@ router.post('/api/backfill/resume', requireAuth, async (req: Request, res: Respo
 
   res.json({ runId, status: 'running', lastPage: run.lastPage });
 
-  backfillAttachments({ ...run.options, resumeFrom: run.lastPage, mode: run.mode }, (progress) => {
+  backfillAttachments({ ...run.options, resumeFrom: run.lastPage, mode: run.mode, attachmentMode: (run.options as any).attachmentMode ?? 'missing' }, (progress) => {
     activeRuns.set(runId, { progress });
     const clients = sseClients.get(runId);
     if (clients) {
@@ -301,6 +304,7 @@ router.get('/api/backfill/runs', requireAuth, async (_req: Request, res: Respons
       completedAt: run.completedAt,
       status: run.status,
       mode: run.mode,
+      attachmentMode: (run.options as any)?.attachmentMode ?? 'missing',
       stats: run.stats,
     })),
   });
@@ -414,6 +418,13 @@ function buildBackfillUI(requiresAuth: boolean): string {
           </select>
         </div>
         <div class="control-group">
+          <label for="attachmentModeSelect">Attachment Mode</label>
+          <select id="attachmentModeSelect">
+            <option value="missing" selected>Missing only (skip if already downloaded)</option>
+            <option value="force">Force re-download all</option>
+          </select>
+        </div>
+        <div class="control-group">
           <label for="batchSize">Batch Size</label>
           <input type="number" id="batchSize" value="5" min="1" max="20">
           <small style="color:#6b7280">Concurrent downloads</small>
@@ -492,10 +503,10 @@ function buildBackfillUI(requiresAuth: boolean): string {
       <div class="runs-header">Run History</div>
       <table>
         <thead>
-          <tr><th>Started</th><th>Mode</th><th>Status</th><th>Downloaded</th><th>Ingested</th><th>Errors</th><th>Duration</th></tr>
+          <tr><th>Started</th><th>Mode</th><th>Att. Mode</th><th>Status</th><th>Downloaded</th><th>Ingested</th><th>Errors</th><th>Duration</th></tr>
         </thead>
         <tbody id="runsTable">
-          <tr><td colspan="7" style="text-align:center;color:#9ca3af">Loading...</td></tr>
+          <tr><td colspan="8" style="text-align:center;color:#9ca3af">Loading...</td></tr>
         </tbody>
       </table>
     </div>
@@ -528,6 +539,7 @@ function buildBackfillUI(requiresAuth: boolean): string {
 
     async function startBackfill() {
       const mode = document.getElementById('modeSelect').value;
+      const attachmentMode = document.getElementById('attachmentModeSelect').value;
       const batchSize = parseInt(document.getElementById('batchSize').value) || 5;
       const limitVal = document.getElementById('limit').value;
       const limit = limitVal ? parseInt(limitVal) : null;
@@ -538,7 +550,7 @@ function buildBackfillUI(requiresAuth: boolean): string {
         const res = await fetch('/api/backfill/start', {
           method: 'POST',
           headers: Object.assign({ 'Content-Type': 'application/json' }, getHeaders()),
-          body: JSON.stringify({ mode, batchSize, limit, resumeFrom, dryRun }),
+          body: JSON.stringify({ mode, attachmentMode, batchSize, limit, resumeFrom, dryRun }),
         });
 
         if (res.status === 401) {
@@ -693,7 +705,8 @@ function buildBackfillUI(requiresAuth: boolean): string {
           const dur = ended ? Math.round((ended - started) / 1000) : '—';
           const durStr = dur === '—' ? '—' : dur < 60 ? dur + 's' : Math.round(dur/60) + 'm';
           const cls = { complete: 'badge-complete', running: 'badge-running', error: 'badge-error', paused: 'badge-paused' }[run.status] || '';
-          return '<tr><td>' + started.toLocaleString() + '</td><td>' + (run.mode || 'slack-api') + '</td><td><span class="badge ' + cls + '">' + run.status + '</span></td><td>' + (run.stats?.downloadedAttachments ?? 0) + '</td><td>' + (run.stats?.ingestedAttachments ?? 0) + '</td><td>' + (run.stats?.errors ?? 0) + '</td><td>' + durStr + '</td></tr>';
+          const attMode = run.attachmentMode || 'missing';
+          return '<tr><td>' + started.toLocaleString() + '</td><td>' + (run.mode || 'slack-api') + '</td><td>' + attMode + '</td><td><span class="badge ' + cls + '">' + run.status + '</span></td><td>' + (run.stats?.downloadedAttachments ?? 0) + '</td><td>' + (run.stats?.ingestedAttachments ?? 0) + '</td><td>' + (run.stats?.errors ?? 0) + '</td><td>' + durStr + '</td></tr>';
         }).join('');
       } catch {}
     }

@@ -13,6 +13,7 @@ export type BackfillOptions = {
   dryRun: boolean;
   resumeFrom: number;
   mode: BackfillMode;
+  attachmentMode: 'missing' | 'force';
 };
 
 export type BackfillStats = {
@@ -49,6 +50,18 @@ export type BackfillProgress = {
 export type ProgressCallback = (progress: BackfillProgress) => void;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+async function hasExistingAttachments(apiUrl: string, token: string, recordId: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${apiUrl}/api/messages/${recordId}/attachments`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return false;
+    const data = await res.json() as unknown[] | { attachments?: unknown[] };
+    const list = Array.isArray(data) ? data : (data.attachments ?? []);
+    return list.length > 0;
+  } catch { return false; }
+}
 
 async function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -396,6 +409,15 @@ export async function backfillAttachments(
         const files = message.metadata?.files ?? [];
         if (files.length === 0) continue;
 
+        if (options.attachmentMode === 'missing') {
+          const hasAttachments = await hasExistingAttachments(apiUrl, readToken, message.record_id);
+          if (hasAttachments) {
+            stats.attachmentsSkipped += files.length;
+            addRecentItem({ filename: `[skipped] ${message.external_id}`, status: 'skipped', messageId: message.external_id });
+            continue;
+          }
+        }
+
         stats.messagesWithAttachments++;
         stats.totalAttachmentsFetched += files.length;
 
@@ -463,7 +485,6 @@ export async function backfillAttachments(
         if (stats.messagesProcessed >= maxMessages) break;
 
         stats.messagesProcessed++;
-        stats.messagesWithAttachments++;
 
         const externalId = `${channelId}:${msg.ts}`;
         const sender = msg.user || msg.bot_id || msg.username || 'unknown';
@@ -484,6 +505,28 @@ export async function backfillAttachments(
         };
 
         const files = msg.files ?? [];
+
+        if (options.attachmentMode === 'missing') {
+          // For slack-api mode, we check by external_id — fetch the message record_id from the DB first
+          // We skip if any existing attachments are found for this external_id
+          const searchRes = await fetch(`${apiUrl}/api/messages?source=slack&external_id=${encodeURIComponent(externalId)}&limit=1`, {
+            headers: { Authorization: `Bearer ${readToken}` },
+          }).catch(() => null);
+          if (searchRes?.ok) {
+            const searchData = await searchRes.json() as { messages?: Array<{ record_id: string }> };
+            const recordId = searchData?.messages?.[0]?.record_id;
+            if (recordId) {
+              const hasAttachments = await hasExistingAttachments(apiUrl, readToken, recordId);
+              if (hasAttachments) {
+                stats.attachmentsSkipped += files.length;
+                addRecentItem({ filename: `[skipped] ${externalId}`, status: 'skipped', messageId: externalId });
+                continue;
+              }
+            }
+          }
+        }
+
+        stats.messagesWithAttachments++;
         stats.totalAttachmentsFetched += files.length;
 
         const messageData = { external_id: externalId, sender, recipient, content, timestamp, metadata };
