@@ -58,7 +58,7 @@ async function executeJob(job: Job, overrides?: JobRunOverrides): Promise<void> 
   }
 
   // Resolve sincePreset → effective Slack Unix timestamp at runtime.
-  // Precedence: sincePreset overrides explicit `after` when both are set.
+  // Priority: lastSyncedAt → startDate → sincePreset (legacy) → explicit after → beginning
   const now = new Date();
   const runSincePreset = overrides?.sincePreset ?? job.sincePreset;
   const runAfter = overrides?.after ?? job.after;
@@ -70,13 +70,23 @@ async function executeJob(job: Job, overrides?: JobRunOverrides): Promise<void> 
   const overlapPctRaw = Number(process.env.SCHEDULE_SINCE_OVERLAP_PERCENT ?? '10');
   const overlapPct = Number.isFinite(overlapPctRaw) ? Math.min(Math.max(overlapPctRaw, 0), 100) : 10;
 
-  const effectiveOldest = runSincePreset
-    ? (() => {
-        const baseMs = sincePresetToMs(runSincePreset);
-        const lookbackMs = Math.round(baseMs * (1 + overlapPct / 100));
-        return timestampToSlackTs(now.getTime() - lookbackMs);
-      })()
-    : runAfter;
+  let afterMs: number | null = null;
+  if (job.lastSyncedAt && !overrides?.after) {
+    afterMs = new Date(job.lastSyncedAt).getTime();
+  } else if (job.startDate && !job.lastSyncedAt && !overrides?.after) {
+    afterMs = new Date(job.startDate).getTime();
+  } else if (runSincePreset) {
+    const baseMs = sincePresetToMs(runSincePreset);
+    const lookbackMs = Math.round(baseMs * (1 + overlapPct / 100));
+    afterMs = now.getTime() - lookbackMs;
+  }
+  // Apply startDate as a floor even when lastSyncedAt is set
+  if (job.startDate && afterMs !== null) {
+    const startMs = new Date(job.startDate).getTime();
+    afterMs = Math.max(afterMs, startMs);
+  }
+  // Convert to Slack oldest timestamp (Unix seconds as string)
+  const effectiveOldest = afterMs != null ? timestampToSlackTs(afterMs) : runAfter;
 
   const startedAt = now.toISOString();
   await updateJob(job.id, { lastStatus: 'running', lastRunAt: startedAt });
@@ -121,7 +131,7 @@ async function executeJob(job: Job, overrides?: JobRunOverrides): Promise<void> 
     });
 
     const finishedAt = new Date().toISOString();
-    await updateJob(job.id, { lastStatus: 'success', lastRunAt: finishedAt });
+    await updateJob(job.id, { lastStatus: 'success', lastRunAt: finishedAt, lastSyncedAt: finishedAt });
     await updateRun(run.runId, {
       finishedAt,
       status: 'success',

@@ -372,6 +372,8 @@ router.patch('/api/jobs/:id', requireAuth, async (req: Request, res: Response) =
     cadencePreset: cadencePresetRaw,
     intervalMinutes: intervalMinutesRaw,
     enabled,
+    startDate,
+    lastSyncedAt,
   } = req.body as {
     name?: string;
     channel?: string;
@@ -382,6 +384,8 @@ router.patch('/api/jobs/:id', requireAuth, async (req: Request, res: Response) =
     cadencePreset?: string | null;
     intervalMinutes?: number;
     enabled?: boolean;
+    startDate?: string | null;
+    lastSyncedAt?: string | null;
   };
 
   const jobId = String(req.params.id);
@@ -392,6 +396,8 @@ router.patch('/api/jobs/:id', requireAuth, async (req: Request, res: Response) =
   if (after !== undefined) patch.after = after === null ? undefined : String(after).trim() || undefined;
   if (before !== undefined) patch.before = before === null ? undefined : String(before).trim() || undefined;
   if (enabled !== undefined) patch.enabled = Boolean(enabled);
+  if (startDate !== undefined) patch.startDate = startDate === null || startDate === '' ? undefined : String(startDate).trim() || undefined;
+  if (lastSyncedAt !== undefined) patch.lastSyncedAt = lastSyncedAt === null || lastSyncedAt === '' ? undefined : String(lastSyncedAt).trim() || undefined;
 
   if (cadencePresetRaw !== undefined) {
     if (cadencePresetRaw === null || cadencePresetRaw === '') {
@@ -435,6 +441,16 @@ router.patch('/api/jobs/:id', requireAuth, async (req: Request, res: Response) =
   }
 
   res.json(updated);
+});
+
+router.post('/api/jobs/:id/reset-sync', requireAuth, async (req: Request, res: Response) => {
+  const jobId = String(req.params.id);
+  const job = await updateJob(jobId, { lastSyncedAt: undefined } as Parameters<typeof updateJob>[1]);
+  if (!job) {
+    res.status(404).json({ error: 'Job not found.' });
+    return;
+  }
+  res.json(job);
 });
 
 router.delete('/api/jobs/:id', requireAuth, async (req: Request, res: Response) => {
