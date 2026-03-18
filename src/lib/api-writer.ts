@@ -72,6 +72,15 @@ export type ApiWriteResult = {
   attachmentsIngested: number;
 };
 
+/** Conflict mode for the Memory Database API. */
+export type ConflictMode = 'skip_or_append' | 'skip_or_overwrite';
+
+/** Resolve conflict_mode from env var, falling back to provided default or 'skip_or_append'. */
+export function getConflictMode(override?: string): ConflictMode {
+  const raw = override || process.env.CONFLICT_MODE || 'skip_or_append';
+  return raw === 'skip_or_overwrite' ? 'skip_or_overwrite' : 'skip_or_append';
+}
+
 /**
  * Write a single message to the API with retry/backoff.
  * Returns 'inserted', 'updated', or 'skipped'.
@@ -79,13 +88,16 @@ export type ApiWriteResult = {
 async function writeOneMessage(
   baseUrl: string,
   token: string,
-  payload: ApiMessagePayload
+  payload: ApiMessagePayload,
+  conflictMode?: ConflictMode
 ): Promise<SingleWriteOutcome> {
+  const mode = conflictMode || getConflictMode();
+  const qs = mode !== 'skip_or_append' ? `?conflict_mode=${mode}` : '';
   for (let attempt = 0; attempt <= MAX_API_RETRIES; attempt++) {
     let res: Response;
 
     try {
-      res = await fetch(`${baseUrl}/api/messages`, {
+      res = await fetch(`${baseUrl}/api/messages${qs}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -181,8 +193,11 @@ async function ingestOneFile(
   token: string,
   payload: ApiMessagePayload,
   fileBuffer: Buffer,
-  file: SlackFileRef
+  file: SlackFileRef,
+  conflictMode?: ConflictMode
 ): Promise<boolean> {
+  const mode = conflictMode || getConflictMode();
+  const qs = `?conflict_mode=${mode}`;
   const filename = file.name || 'attachment';
   const contentType = file.mimetype || 'application/octet-stream';
   const attachmentsMeta = [
@@ -203,7 +218,7 @@ async function ingestOneFile(
       );
       form.append('attachments_meta', JSON.stringify(attachmentsMeta));
 
-      const res = await fetch(`${baseUrl}/api/messages/ingest`, {
+      const res = await fetch(`${baseUrl}/api/messages/ingest${qs}`, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${token}`,
@@ -260,7 +275,8 @@ async function writeMessageWithFiles(
   baseUrl: string,
   writeToken: string,
   payload: ApiMessagePayload,
-  files: SlackFileRef[]
+  files: SlackFileRef[],
+  conflictMode?: ConflictMode
 ): Promise<{
   outcome: SingleWriteOutcome;
   downloaded: number;
@@ -290,7 +306,7 @@ async function writeMessageWithFiles(
       continue;
     }
 
-    const ok = await ingestOneFile(baseUrl, writeToken, payload, fileBuffer, file);
+    const ok = await ingestOneFile(baseUrl, writeToken, payload, fileBuffer, file, conflictMode);
     if (ok) ingested++;
   }
 
@@ -303,7 +319,7 @@ async function writeMessageWithFiles(
   console.warn(
     `[api-writer] All file downloads/ingests failed for ${payload.external_id} — falling back to plain JSON write`
   );
-  const outcome = await writeOneMessage(baseUrl, writeToken, payload);
+  const outcome = await writeOneMessage(baseUrl, writeToken, payload, conflictMode);
   return { outcome, downloaded, ingested };
 }
 
@@ -317,11 +333,13 @@ async function writeMessageWithFiles(
  *                  attachmentsDownloaded, attachmentsIngested.
  */
 export async function writeMessagesViaApi(
-  payloads: Array<{ payload: ApiMessagePayload; attachmentCount: number; files?: SlackFileRef[] }>
+  payloads: Array<{ payload: ApiMessagePayload; attachmentCount: number; files?: SlackFileRef[] }>,
+  conflictMode?: ConflictMode
 ): Promise<ApiWriteResult> {
   const baseUrl = (process.env.MEMORY_DATABASE_API_URL ?? '').replace(/\/+$/, '');
   const readToken = process.env.MEMORY_DATABASE_API_TOKEN ?? '';
   const writeToken = process.env.MEMORY_DATABASE_API_WRITE_TOKEN ?? readToken;
+  const mode = conflictMode || getConflictMode();
 
   let inserted = 0;
   let updated = 0;
@@ -338,7 +356,8 @@ export async function writeMessagesViaApi(
         baseUrl,
         writeToken,
         payload,
-        files
+        files,
+        mode
       );
       attachmentsDownloaded += downloaded;
       attachmentsIngested += ingested;
@@ -346,7 +365,7 @@ export async function writeMessagesViaApi(
       else if (outcome === 'updated') updated++;
       else skipped++;
     } else {
-      const outcome = await writeOneMessage(baseUrl, writeToken, payload);
+      const outcome = await writeOneMessage(baseUrl, writeToken, payload, mode);
       if (outcome === 'inserted') inserted++;
       else if (outcome === 'updated') updated++;
       else skipped++;
