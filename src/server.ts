@@ -572,7 +572,13 @@ const LOGIN_HTML = /* html */ `<!DOCTYPE html>
 </div>
 
 <script>
-const BASE = '/api';
+// Detect proxy base path from current URL
+const BASE = (() => {
+  const path = location.pathname;
+  const marker = '/login';
+  const idx = path.lastIndexOf(marker);
+  return idx >= 0 ? path.slice(0, idx) + '/api' : '/api';
+})();
 let ws = null;
 let sessionActive = false;
 let startTime = null;
@@ -618,7 +624,13 @@ function stopTimer() {
 
 function connectWs() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(proto + '//' + location.host + '/ws/login');
+  const wsBase = (() => {
+    const path = location.pathname;
+    const marker = '/login';
+    const idx = path.lastIndexOf(marker);
+    return idx >= 0 ? path.slice(0, idx) : '';
+  })();
+  ws = new WebSocket(proto + '//' + location.host + wsBase + '/ws/login');
   ws.onmessage = (event) => {
     try {
       const msg = JSON.parse(event.data);
@@ -643,7 +655,14 @@ function connectWs() {
         showOverlay('✅ Login successful! Redirecting...');
         document.getElementById('start-btn').disabled = false;
         if (ws) { try { ws.close(); } catch {} ws = null; }
-        setTimeout(() => { window.location.href = '/sync'; }, 3000);
+        setTimeout(() => {
+          const basePath = location.pathname;
+          if (basePath.includes('/proxy/')) {
+            window.location.href = '/slack/dashboard';
+          } else {
+            window.location.href = '/sync';
+          }
+        }, 3000);
       }
     } catch(e) {}
   };
