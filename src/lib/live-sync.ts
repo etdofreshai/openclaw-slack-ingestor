@@ -439,6 +439,7 @@ export async function syncSlackChannel(
     latest?: string;
     limit?: number;
     verbose?: boolean;
+    conflictMode?: string;
   }
 ): Promise<SyncResult> {
   if (!hasSession()) {
@@ -484,7 +485,7 @@ export async function syncSlackChannel(
       files: (msg.metadata.files ?? []) as SlackFileRef[],
     }));
 
-    const writeResult = await writeMessagesViaApi(inputs);
+    const writeResult = await writeMessagesViaApi(inputs, options?.conflictMode as any);
     result = { fetched: allMessages.length, ...writeResult };
   } else {
     // ── PostgreSQL write mode ───────────────────────────────────────────────

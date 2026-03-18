@@ -27,6 +27,7 @@ export type JobRunOverrides = {
   before?: string;
   after?: string;
   sincePreset?: Job['sincePreset'];
+  conflictMode?: string;
 };
 
 /**
@@ -71,7 +72,10 @@ async function executeJob(job: Job, overrides?: JobRunOverrides): Promise<void> 
   const overlapPct = Number.isFinite(overlapPctRaw) ? Math.min(Math.max(overlapPctRaw, 0), 100) : 10;
 
   let afterMs: number | null = null;
-  if (job.lastSyncedAt && !overrides?.after) {
+  if (runSincePreset === 'all') {
+    // Full backfill — ignore lastSyncedAt and startDate
+    afterMs = null;
+  } else if (job.lastSyncedAt && !overrides?.after) {
     afterMs = new Date(job.lastSyncedAt).getTime();
   } else if (job.startDate && !job.lastSyncedAt && !overrides?.after) {
     afterMs = new Date(job.startDate).getTime();
@@ -128,6 +132,7 @@ async function executeJob(job: Job, overrides?: JobRunOverrides): Promise<void> 
       latest: runBefore,
       limit: runLimit,
       verbose: true,
+      conflictMode: overrides?.conflictMode,
     });
 
     const finishedAt = new Date().toISOString();

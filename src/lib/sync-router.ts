@@ -327,7 +327,9 @@ router.post('/api/jobs/:id/run', requireAuth, async (req: Request, res: Response
     return;
   }
 
-  runJobNow(job).catch((err: unknown) => {
+  const conflictMode = (req.body?.conflict_mode as string | undefined) ?? (req.query.conflict_mode as string | undefined);
+
+  runJobNow(job, conflictMode ? { conflictMode } : undefined).catch((err: unknown) => {
     console.error(`[API] runJobNow error for job ${job.id}:`, err);
   });
 
@@ -342,12 +344,15 @@ router.post('/api/jobs/:id/run-all', requireAuth, async (req: Request, res: Resp
     return;
   }
 
+  const conflictMode = (req.body?.conflict_mode as string | undefined) ?? (req.query.conflict_mode as string | undefined);
+
   // Full history backfill: use 'all' since preset, no limit
   runJobNow(job, {
     sincePreset: 'all',
     limit: undefined,
     before: undefined,
     after: undefined,
+    conflictMode,
   }).catch((err: unknown) => {
     console.error(`[API] run-all error for job ${job.id}:`, err);
   });
