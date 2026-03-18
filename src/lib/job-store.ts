@@ -57,43 +57,98 @@ const DATA_ROOT = process.env.DATA_DIR
 
 const DATA_DIR = path.join(DATA_ROOT, 'jobs');
 const JOBS_FILE = path.join(DATA_DIR, 'jobs.json');
+const JOBS_BACKUP_FILE = path.join(DATA_DIR, 'jobs.json.bak');
 
 async function ensureDir(): Promise<void> {
   await fs.mkdir(DATA_DIR, { recursive: true });
 }
 
+// Simple write-lock mutex to prevent concurrent writes
+let writeLock: Promise<void> = Promise.resolve();
+
+async function withWriteLock<T>(fn: () => Promise<T>): Promise<T> {
+  let release: () => void;
+  const prev = writeLock;
+  writeLock = new Promise<void>(resolve => { release = resolve; });
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release!();
+  }
+}
+
 export async function loadJobs(): Promise<Job[]> {
+  // Try main file first
   try {
     const raw = await fs.readFile(JOBS_FILE, 'utf8');
     return JSON.parse(raw) as Job[];
   } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      // File doesn't exist yet, try backup
+    } else {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[job-store] Failed to read/parse jobs from ${JOBS_FILE}: ${message}. Trying backup...`);
+    }
+  }
+
+  // Try backup file
+  try {
+    const raw = await fs.readFile(JOBS_BACKUP_FILE, 'utf8');
+    const jobs = JSON.parse(raw) as Job[];
+    console.warn(`[job-store] Recovered ${jobs.length} jobs from backup file.`);
+    return jobs;
+  } catch (err: unknown) {
     if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
       const message = err instanceof Error ? err.message : String(err);
-      console.warn(`[job-store] Failed to read/parse jobs from ${JOBS_FILE}: ${message}`);
+      console.warn(`[job-store] Failed to read/parse backup jobs from ${JOBS_BACKUP_FILE}: ${message}`);
     }
-    return [];
   }
+
+  // Both corrupt or missing — start fresh
+  console.warn(`[job-store] Both main and backup job files are missing or corrupt. Starting with empty job list.`);
+  return [];
 }
 
 async function saveJobs(jobs: Job[]): Promise<void> {
   await ensureDir();
-  await fs.writeFile(JOBS_FILE, JSON.stringify(jobs, null, 2), 'utf8');
+  const content = JSON.stringify(jobs, null, 2);
+  const tmpFile = `${JOBS_FILE}.tmp.${process.pid}.${Date.now()}`;
+
+  // Write to temp file first
+  await fs.writeFile(tmpFile, content, 'utf8');
+
+  // Write backup before replacing main file (if main exists)
+  try {
+    await fs.copyFile(JOBS_FILE, JOBS_BACKUP_FILE);
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+      // Ignore ENOENT (no existing file), warn on other errors
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[job-store] Failed to write backup: ${message}`);
+    }
+  }
+
+  // Atomic rename: temp → main
+  await fs.rename(tmpFile, JOBS_FILE);
 }
 
 export async function createJob(
   data: Omit<Job, 'id' | 'createdAt' | 'updatedAt'>
 ): Promise<Job> {
-  const jobs = await loadJobs();
-  const now = new Date().toISOString();
-  const job: Job = {
-    ...data,
-    id: crypto.randomUUID(),
-    createdAt: now,
-    updatedAt: now,
-  };
-  jobs.push(job);
-  await saveJobs(jobs);
-  return job;
+  return withWriteLock(async () => {
+    const jobs = await loadJobs();
+    const now = new Date().toISOString();
+    const job: Job = {
+      ...data,
+      id: crypto.randomUUID(),
+      createdAt: now,
+      updatedAt: now,
+    };
+    jobs.push(job);
+    await saveJobs(jobs);
+    return job;
+  });
 }
 
 export async function getJob(id: string): Promise<Job | null> {
@@ -105,19 +160,23 @@ export async function updateJob(
   id: string,
   patch: Partial<Omit<Job, 'id' | 'createdAt'>>
 ): Promise<Job | null> {
-  const jobs = await loadJobs();
-  const idx = jobs.findIndex(j => j.id === id);
-  if (idx === -1) return null;
-  jobs[idx] = { ...jobs[idx], ...patch, updatedAt: new Date().toISOString() };
-  await saveJobs(jobs);
-  return jobs[idx];
+  return withWriteLock(async () => {
+    const jobs = await loadJobs();
+    const idx = jobs.findIndex(j => j.id === id);
+    if (idx === -1) return null;
+    jobs[idx] = { ...jobs[idx], ...patch, updatedAt: new Date().toISOString() };
+    await saveJobs(jobs);
+    return jobs[idx];
+  });
 }
 
 export async function deleteJob(id: string): Promise<boolean> {
-  const jobs = await loadJobs();
-  const idx = jobs.findIndex(j => j.id === id);
-  if (idx === -1) return false;
-  jobs.splice(idx, 1);
-  await saveJobs(jobs);
-  return true;
+  return withWriteLock(async () => {
+    const jobs = await loadJobs();
+    const idx = jobs.findIndex(j => j.id === id);
+    if (idx === -1) return false;
+    jobs.splice(idx, 1);
+    await saveJobs(jobs);
+    return true;
+  });
 }
