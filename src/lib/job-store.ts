@@ -78,30 +78,85 @@ async function withWriteLock<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+/**
+ * Attempt to salvage a valid JSON array from a potentially corrupt string.
+ * Tries progressively shorter substrings ending with ']' to recover partial data.
+ */
+function trySalvageJSON(raw: string): Job[] | null {
+  // Quick check: is it a valid array already?
+  try { const arr = JSON.parse(raw); if (Array.isArray(arr)) return arr as Job[]; } catch {}
+
+  // Try to find the last valid ']' and parse up to it
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith('[')) return null;
+
+  for (let i = trimmed.length; i > 1; i--) {
+    const lastBracket = trimmed.lastIndexOf(']', i - 1);
+    if (lastBracket <= 0) break;
+    try {
+      const candidate = trimmed.slice(0, lastBracket + 1);
+      const arr = JSON.parse(candidate);
+      if (Array.isArray(arr) && arr.length > 0) {
+        console.warn(`[job-store] Salvaged ${arr.length} jobs from corrupt file (truncated at position ${lastBracket + 1}/${trimmed.length})`);
+        return arr as Job[];
+      }
+    } catch {}
+    // Try removing a trailing partial object + comma: [..., {partial]  →  [...}]
+    const lastComma = trimmed.lastIndexOf(',', lastBracket - 1);
+    if (lastComma > 0) {
+      try {
+        const candidate = trimmed.slice(0, lastComma) + ']';
+        const arr = JSON.parse(candidate);
+        if (Array.isArray(arr) && arr.length > 0) {
+          console.warn(`[job-store] Salvaged ${arr.length} jobs (dropped last partial entry)`);
+          return arr as Job[];
+        }
+      } catch {}
+    }
+    break; // Only try the outermost bracket positions
+  }
+  return null;
+}
+
+function tryParseOrSalvage(raw: string, label: string): Job[] | null {
+  try {
+    return JSON.parse(raw) as Job[];
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(`[job-store] JSON.parse failed for ${label}: ${message}. Attempting salvage...`);
+    return trySalvageJSON(raw);
+  }
+}
+
 export async function loadJobs(): Promise<Job[]> {
   // Try main file first
   try {
     const raw = await fs.readFile(JOBS_FILE, 'utf8');
-    return JSON.parse(raw) as Job[];
+    const jobs = tryParseOrSalvage(raw, JOBS_FILE);
+    if (jobs !== null) return jobs;
+    console.warn(`[job-store] Main file unsalvageable. Trying backup...`);
   } catch (err: unknown) {
     if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
       // File doesn't exist yet, try backup
     } else {
       const message = err instanceof Error ? err.message : String(err);
-      console.warn(`[job-store] Failed to read/parse jobs from ${JOBS_FILE}: ${message}. Trying backup...`);
+      console.warn(`[job-store] Failed to read jobs from ${JOBS_FILE}: ${message}. Trying backup...`);
     }
   }
 
   // Try backup file
   try {
     const raw = await fs.readFile(JOBS_BACKUP_FILE, 'utf8');
-    const jobs = JSON.parse(raw) as Job[];
-    console.warn(`[job-store] Recovered ${jobs.length} jobs from backup file.`);
-    return jobs;
+    const jobs = tryParseOrSalvage(raw, JOBS_BACKUP_FILE);
+    if (jobs !== null) {
+      console.warn(`[job-store] Recovered ${jobs.length} jobs from backup file.`);
+      return jobs;
+    }
+    console.warn(`[job-store] Backup file also unsalvageable.`);
   } catch (err: unknown) {
     if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
       const message = err instanceof Error ? err.message : String(err);
-      console.warn(`[job-store] Failed to read/parse backup jobs from ${JOBS_BACKUP_FILE}: ${message}`);
+      console.warn(`[job-store] Failed to read backup jobs from ${JOBS_BACKUP_FILE}: ${message}`);
     }
   }
 
@@ -118,12 +173,18 @@ async function saveJobs(jobs: Job[]): Promise<void> {
   // Write to temp file first
   await fs.writeFile(tmpFile, content, 'utf8');
 
-  // Write backup before replacing main file (if main exists)
+  // Write backup before replacing main file — but only if current file is valid JSON
   try {
+    const existing = await fs.readFile(JOBS_FILE, 'utf8');
+    // Validate the existing file parses as JSON before using it as backup
+    JSON.parse(existing);
     await fs.copyFile(JOBS_FILE, JOBS_BACKUP_FILE);
   } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
-      // Ignore ENOENT (no existing file), warn on other errors
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      // No existing file to backup — that's fine
+    } else if (err instanceof SyntaxError) {
+      console.warn(`[job-store] Skipping backup — existing jobs.json is corrupt (would overwrite good backup)`);
+    } else {
       const message = err instanceof Error ? err.message : String(err);
       console.warn(`[job-store] Failed to write backup: ${message}`);
     }
@@ -167,6 +228,16 @@ export async function updateJob(
     jobs[idx] = { ...jobs[idx], ...patch, updatedAt: new Date().toISOString() };
     await saveJobs(jobs);
     return jobs[idx];
+  });
+}
+
+export async function resetJobs(): Promise<void> {
+  return withWriteLock(async () => {
+    await ensureDir();
+    await saveJobs([]);
+    // Also clear backup to avoid stale recovery
+    try { await fs.unlink(JOBS_BACKUP_FILE); } catch {}
+    console.warn('[job-store] All jobs reset (cleared).');
   });
 }
 

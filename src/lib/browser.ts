@@ -77,9 +77,10 @@ export async function ensureChromium(): Promise<void> {
       }
 
       chromiumProc = spawn(CHROMIUM_PATH, [
-        "--headless=new",
+        "--headless",
         "--disable-gpu",
         "--no-sandbox",
+        "--single-process",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-blink-features=AutomationControlled",

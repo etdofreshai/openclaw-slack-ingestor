@@ -9,6 +9,7 @@ import {
   getJob,
   updateJob,
   deleteJob,
+  resetJobs,
 } from './job-store.js';
 import { getRecentRuns, createRun, updateRun } from './run-store.js';
 import { scheduleJob, unscheduleJob, runJobNow } from './scheduler.js';
@@ -467,6 +468,12 @@ router.delete('/api/jobs/:id', requireAuth, async (req: Request, res: Response) 
     return;
   }
   res.json({ success: true });
+});
+
+// Reset all jobs (nuclear option for corrupt state)
+router.post('/api/jobs/reset', requireAuth, async (_req: Request, res: Response) => {
+  await resetJobs();
+  res.json({ success: true, message: 'All jobs cleared.' });
 });
 
 // ── API: runs ───────────────────────────────────────────────────────────────────
