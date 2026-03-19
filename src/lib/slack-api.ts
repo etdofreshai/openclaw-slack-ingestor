@@ -33,6 +33,9 @@ interface ConversationsListResponse {
     is_channel: boolean;
     is_private: boolean;
     is_member: boolean;
+    is_im?: boolean;
+    is_mpim?: boolean;
+    user?: string;
   }>;
   response_metadata?: { next_cursor?: string };
 }
@@ -168,7 +171,22 @@ export async function listChannels(): Promise<{ channels: Array<{ id: string; na
     }
 
     for (const ch of result.data?.channels || []) {
-      channels.push({ id: ch.id, name: ch.name || ch.id });
+      let name: string;
+      if (ch.is_im && ch.user) {
+        const username = await getUsername(ch.user);
+        name = `DM: ${username}`;
+      } else if (ch.is_mpim && ch.name) {
+        // mpim names look like "mpdm-user1--user2--user3-1", clean them up
+        const cleaned = ch.name
+          .replace(/^mpdm-/, "")
+          .replace(/-\d+$/, "")
+          .split("--")
+          .join(", ");
+        name = `Group DM: ${cleaned}`;
+      } else {
+        name = ch.name || ch.id;
+      }
+      channels.push({ id: ch.id, name });
     }
 
     cursor = result.data?.response_metadata?.next_cursor;
