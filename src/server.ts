@@ -84,6 +84,19 @@ app.use(express.json());
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
+// Session status (used by login page to detect existing session)
+app.get("/api/session/check", async (_req, res) => {
+  if (!hasSession()) {
+    return res.json({ authenticated: false });
+  }
+  const validation = await validateSession();
+  res.json({
+    authenticated: validation.valid,
+    team: (validation as { team?: string }).team,
+    user: (validation as { user?: string }).user,
+  });
+});
+
 // Root — info endpoint
 app.get("/", (_req, res) => {
   res.json({
@@ -740,6 +753,30 @@ function sendKey(key) {
   if (!sessionActive || !ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify({ type: 'keydown', key }));
 }
+
+// Check if already logged in on page load
+async function checkExistingSession() {
+  try {
+    const r = await fetch(BASE.replace(/\\/api$/, '/api') + '/session/check');
+    const data = await r.json();
+    if (data.authenticated) {
+      setStatus('✅ Already logged in as ' + (data.user || 'unknown') + (data.team ? ' (' + data.team + ')' : '') + ' — redirecting…', 'success');
+      document.getElementById('start-btn').disabled = true;
+      showOverlay('✅ Already logged in! Redirecting…');
+      setTimeout(() => {
+        const basePath = location.pathname;
+        if (basePath.includes('/proxy/')) {
+          window.location.href = '/slack/dashboard';
+        } else {
+          window.location.href = '/sync';
+        }
+      }, 2000);
+      return true;
+    }
+  } catch(e) {}
+  return false;
+}
+checkExistingSession();
 </script>
 </body>
 </html>`;

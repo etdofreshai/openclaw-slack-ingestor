@@ -655,6 +655,24 @@ tbody tr:hover td{background:rgba(255,255,255,.03)}
   <a class="nav-link" href="/login" style="margin-left:auto">Manage Login →</a>
 </div>
 
+<!-- ── Channel List with Batch Operations ── -->
+<div class="card" id="channel-list-card">
+  <div class="card-header">
+    <span class="card-title">📺 Channels</span>
+    <div style="display:flex;gap:6px;align-items:center">
+      <button class="btn btn-sm btn-ghost" onclick="selectAllChannels()">Select All</button>
+      <button class="btn btn-sm btn-ghost" onclick="deselectAllChannels()">Deselect All</button>
+      <button class="btn btn-sm btn-run" onclick="massSchedule()" id="mass-schedule-btn" disabled>📅 Mass Schedule</button>
+      <button class="btn btn-sm btn-primary" onclick="massBackfill()" id="mass-backfill-btn" disabled>⟳ Mass Backfill</button>
+      <button class="btn btn-sm btn-ghost" onclick="loadChannelList()">↻ Refresh</button>
+    </div>
+  </div>
+  <div id="channel-list-container" style="max-height:400px;overflow-y:auto">
+    <div style="color:#555;font-size:.85rem;padding:12px 0">Loading channels…</div>
+  </div>
+  <div id="channel-selection-count" style="font-size:.78rem;color:#888;margin-top:8px"></div>
+</div>
+
 <!-- ── Scheduler Queue Status Widget ── -->
 <div class="card" id="queue-card">
   <div class="card-header">
@@ -996,10 +1014,21 @@ function showResult(type, label, data) {
 
 // ── Jobs table ──────────────────────────────────────────────────────────────
 let _loadedJobs = [];
+let _apiChannelNames = {};  // channel ID → name from Slack API
 
 async function loadJobsTable() {
   const el = document.getElementById('jobs-container');
   try {
+    // Also refresh channel names for deleted channel detection
+    try {
+      const chRes = await fetch('/api/channels', { headers: getHeaders() });
+      if (chRes.ok) {
+        const chs = await chRes.json();
+        _apiChannelNames = {};
+        for (const ch of chs) _apiChannelNames[ch.id] = ch.name;
+      }
+    } catch {}
+
     const res = await fetch('/api/jobs', { headers: getHeaders() });
     if (res.status === 401) { el.innerHTML = '<p style="color:#f87171;font-size:.85rem">Not authenticated.</p>'; return; }
     const jobs = await res.json();
@@ -1034,9 +1063,20 @@ function renderJobsTable(jobs) {
       ? '<span class="status-pill pill-run">' + esc(COMPACT_LABELS[j.sincePreset] || j.sincePreset) + '</span>'
       : (j.after ? '<span class="mono" style="font-size:.72rem" title="Static oldest ts">' + esc(j.after.slice(0,14)) + '…</span>' : '—');
 
+    // Channel name with deleted detection
+    var channelName = _apiChannelNames[j.channel];
+    var isDeleted = !channelName;
+    if (isDeleted) {
+      // Fall back to name from job (strip "every ..." suffix)
+      channelName = j.name.replace(/^#/, '').replace(/ every .*$/, '') || j.channel;
+    }
+    var channelDisplay = isDeleted
+      ? '<div style="display:flex;flex-direction:column;line-height:1.2"><span style="text-decoration:line-through;color:#888">' + esc(channelName) + '</span><span style="color:#ef4444;font-size:.62rem;font-weight:700">[deleted]</span><span class="mono" style="font-size:.72rem;color:#9ca3af">' + esc(j.channel) + '</span></div>'
+      : '<div style="display:flex;flex-direction:column;line-height:1.2"><span>#' + esc(channelName) + '</span><span class="mono" style="font-size:.72rem;color:#9ca3af">' + esc(j.channel) + '</span></div>';
+
     return '<tr>' +
       '<td>' + esc(j.name) + '</td>' +
-      '<td><span class="mono">' + esc(j.channel) + '</span></td>' +
+      '<td>' + channelDisplay + '</td>' +
       '<td>' + cadenceCell + '</td>' +
       '<td>' + sinceCell + '</td>' +
       '<td>' + enabledPill + '</td>' +
@@ -1309,9 +1349,177 @@ function onChannelSelect() {
   updateAutoNamePreview();
 }
 
+// ── Channel list with checkboxes ────────────────────────────────────────────
+let _channelListData = [];
+let _jobsByChannel = {};
+
+async function loadChannelList() {
+  const el = document.getElementById('channel-list-container');
+  try {
+    // Load channels and jobs in parallel
+    const [chRes, jobsRes] = await Promise.all([
+      fetch('/api/channels', { headers: getHeaders() }),
+      fetch('/api/jobs', { headers: getHeaders() }),
+    ]);
+
+    let channels = [];
+    if (chRes.ok) channels = await chRes.json();
+    const jobs = jobsRes.ok ? await jobsRes.json() : [];
+
+    // Build a map of channel IDs that have jobs
+    _jobsByChannel = {};
+    const jobChannelIds = new Set();
+    for (const j of jobs) {
+      _jobsByChannel[j.channel] = j;
+      jobChannelIds.add(j.channel);
+    }
+
+    // Build channel ID→name map from API channels
+    const apiChannelMap = {};
+    for (const ch of channels) apiChannelMap[ch.id] = ch.name;
+
+    // Find deleted channels: in jobs but not in API channel list
+    const deletedChannels = [];
+    for (const j of jobs) {
+      if (!apiChannelMap[j.channel]) {
+        deletedChannels.push({
+          id: j.channel,
+          name: j.name.replace(/^#/, '').replace(/ every .*$/, '') || j.channel,
+          isDeleted: true,
+        });
+      }
+    }
+
+    // Merge: API channels + deleted channels from jobs
+    _channelListData = [
+      ...channels.map(function(ch) {
+        return { id: ch.id, name: ch.name, isDeleted: false, hasJob: jobChannelIds.has(ch.id) };
+      }),
+      ...deletedChannels.map(function(ch) {
+        return { id: ch.id, name: ch.name, isDeleted: true, hasJob: true };
+      }),
+    ];
+
+    renderChannelList();
+  } catch (err) {
+    el.innerHTML = '<p style="color:#f87171;font-size:.85rem">Error loading channels: ' + esc(err.message) + '</p>';
+  }
+}
+
+function renderChannelList() {
+  const el = document.getElementById('channel-list-container');
+  if (!_channelListData.length) {
+    el.innerHTML = '<p style="color:#555;font-size:.85rem;padding:12px 0">No channels found.</p>';
+    return;
+  }
+  const rows = _channelListData.map(function(ch) {
+    const nameDisplay = ch.isDeleted
+      ? '<span style="text-decoration:line-through;color:#888">' + esc(ch.name) + '</span> <span style="color:#ef4444;font-size:.72rem;font-weight:700">[deleted]</span>'
+      : esc(ch.name);
+    const jobBadge = ch.hasJob
+      ? ' <span class="status-pill pill-ok" style="font-size:.6rem">scheduled</span>'
+      : '';
+    return '<label style="display:flex;align-items:center;gap:8px;padding:6px 8px;border-bottom:1px solid #2a2d31;cursor:pointer" onmouseover="this.style.background=\\'rgba(255,255,255,.03)\\'" onmouseout="this.style.background=\\'\\'"><input type="checkbox" class="ch-checkbox" value="' + esc(ch.id) + '" data-name="' + esc(ch.name) + '" onchange="updateChannelSelectionCount()"/><span>' + nameDisplay + '</span>' + jobBadge + '<span class="mono" style="font-size:.72rem;color:#9ca3af;margin-left:auto">' + esc(ch.id) + '</span></label>';
+  }).join('');
+  el.innerHTML = rows;
+  updateChannelSelectionCount();
+}
+
+function getSelectedChannels() {
+  const checks = document.querySelectorAll('.ch-checkbox:checked');
+  return Array.from(checks).map(function(cb) { return { id: cb.value, name: cb.getAttribute('data-name') }; });
+}
+
+function updateChannelSelectionCount() {
+  const selected = getSelectedChannels();
+  const el = document.getElementById('channel-selection-count');
+  el.textContent = selected.length > 0 ? selected.length + ' channel(s) selected' : '';
+  document.getElementById('mass-schedule-btn').disabled = selected.length === 0;
+  document.getElementById('mass-backfill-btn').disabled = selected.length === 0;
+}
+
+function selectAllChannels() {
+  document.querySelectorAll('.ch-checkbox').forEach(function(cb) { cb.checked = true; });
+  updateChannelSelectionCount();
+}
+
+function deselectAllChannels() {
+  document.querySelectorAll('.ch-checkbox').forEach(function(cb) { cb.checked = false; });
+  updateChannelSelectionCount();
+}
+
+async function massSchedule() {
+  const selected = getSelectedChannels();
+  if (!selected.length) return;
+  const cadence = prompt('Cadence preset for all selected channels (e.g. 1h, 6h, 1d, 1w):', '1h');
+  if (!cadence) return;
+  const btn = document.getElementById('mass-schedule-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Scheduling…';
+  let created = 0, errors = 0;
+  for (const ch of selected) {
+    try {
+      const res = await fetch('/api/jobs', {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify({ channel: ch.id, cadencePreset: cadence, enabled: true }),
+      });
+      if (res.ok) created++;
+      else errors++;
+    } catch { errors++; }
+  }
+  btn.textContent = '📅 Mass Schedule';
+  btn.disabled = false;
+  alert('Created ' + created + ' job(s)' + (errors ? ', ' + errors + ' error(s)' : ''));
+  loadJobsTable();
+  loadChannelList();
+}
+
+async function massBackfill() {
+  const selected = getSelectedChannels();
+  if (!selected.length) return;
+  if (!confirm('Run full backfill (all history) for ' + selected.length + ' channel(s)? This may take a while.')) return;
+  const btn = document.getElementById('mass-backfill-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Backfilling…';
+  let triggered = 0, errors = 0;
+  for (const ch of selected) {
+    // Check if a job exists for this channel; if not, create one first
+    let jobId = _jobsByChannel[ch.id]?.id;
+    if (!jobId) {
+      try {
+        const createRes = await fetch('/api/jobs', {
+          method: 'POST',
+          headers: getHeaders(),
+          body: JSON.stringify({ channel: ch.id, cadencePreset: '1d', enabled: false }),
+        });
+        if (createRes.ok) {
+          const newJob = await createRes.json();
+          jobId = newJob.id;
+        }
+      } catch {}
+    }
+    if (jobId) {
+      try {
+        const res = await fetch('/api/jobs/' + jobId + '/run-all', { method: 'POST', headers: getHeaders() });
+        if (res.ok) triggered++;
+        else errors++;
+      } catch { errors++; }
+    } else {
+      errors++;
+    }
+  }
+  btn.textContent = '⟳ Mass Backfill';
+  btn.disabled = false;
+  alert('Triggered backfill for ' + triggered + ' channel(s)' + (errors ? ', ' + errors + ' error(s)' : ''));
+  loadJobsTable();
+  loadRunsTable();
+}
+
 function loadAll() {
   loadLoginStatus();
   loadChannels();
+  loadChannelList();
   loadJobsTable();
   loadRunsTable();
   loadQueueStatus();
